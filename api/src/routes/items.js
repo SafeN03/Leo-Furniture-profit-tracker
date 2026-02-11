@@ -13,100 +13,128 @@ const ItemCreate = z.object({
   cost: z.number().nonnegative(),
   in_store: z.boolean(),
   sold_price: z.number().nonnegative().optional(),
-  delivery_price: z.number().nonnegative().optional()
+  delivery_price: z.number().nonnegative().optional(),
 });
 
+router.get(
+  "/",
+  requireAuth,
+  asyncWrap(async (req, res) => {
+    const result = await pool.query(
+      "SELECT * FROM items WHERE user_id=$1 ORDER BY created_at DESC",
+      [req.user.id]
+    );
+    return res.json({ items: result.rows });
+  })
+);
 
-router.get("/", requireAuth, asyncWrap(async (req, res) => {
-  const result = await pool.query(
-    "SELECT * FROM items WHERE user_id=$1 ORDER BY created_at DESC",
-    [req.user.id]
-  );
-  return res.json({ items: result.rows });
-}));
+router.post(
+  "/",
+  requireAuth,
+  asyncWrap(async (req, res) => {
+    const body = ItemCreate.parse(req.body);
 
-router.post("/", requireAuth, asyncWrap(async (req, res) => {
-  const body = ItemCreate.parse(req.body);
+    if (!body.in_store && (body.sold_price === undefined || body.sold_price === null)) {
+      return res.status(400).json({ error: "sold_price is required when item is sold" });
+    }
 
-  // If sold, sold_price is required
-  if (!body.in_store && (body.sold_price === undefined || body.sold_price === null)) {
-    return res.status(400).json({ error: "sold_price is required when item is sold" });
-  }
+    const result = await pool.query(
+      `INSERT INTO items(
+        user_id,
+        item_number,
+        title,
+        category,
+        purchase_price,
+        sold_price,
+        in_store,
+        delivery_price,
+        status
+      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+      RETURNING *`,
+      [
+        req.user.id,
+        body.item_number,
+        body.title,
+        body.category,
+        body.cost,
+        body.in_store ? null : (body.sold_price ?? 0),
+        body.in_store,
+        body.in_store ? 0 : (body.delivery_price ?? 0),
+        body.in_store ? "in_store" : "sold",
+      ]
+    );
 
-  const result = await pool.query(
-    `INSERT INTO items(
-      user_id,
-      item_number,
-      title,
-      category,
-      purchase_price,
-      sold_price,
-      in_store,
-      delivery_price,
-      status
-    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
-    RETURNING *`,
-    [
-      req.user.id,
-      body.item_number,
-      body.title,
-      body.category,
-      body.cost,
-      body.in_store ? null : (body.sold_price ?? 0),
-      body.in_store,
-      body.in_store ? 0 : (body.delivery_price ?? 0),
-      body.in_store ? "in_store" : "sold"
-    ]
-  );
+    return res.status(201).json({ item: result.rows[0] });
+  })
+);
 
-  return res.status(201).json({ item: result.rows[0] });
-}));
-
-
+// PATCH for Mark Sold
 const ItemUpdate = z.object({
-  status: z.enum(["listed", "sold", "shipped", "returned"]).optional(),
-  sold_price: z.number().nonnegative().optional()
+  title: z.string().min(1).optional(),
+  category: z.enum(["Living Room", "Dining Room", "Bedrooms", "Mattresses", "Rugs"]).optional(),
+  purchase_price: z.number().nonnegative().optional(),
+  in_store: z.boolean().optional(),
+  sold_price: z.number().nonnegative().optional(),
+  delivery_price: z.number().nonnegative().optional(),
+  status: z.enum(["in_store", "sold"]).optional(),
 });
 
-router.patch("/:id", requireAuth, asyncWrap(async (req, res) => {
-  const id = Number(req.params.id);
-  const patch = ItemUpdate.parse(req.body);
+router.patch(
+  "/:id",
+  requireAuth,
+  asyncWrap(async (req, res) => {
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid id" });
 
-  const fields = [];
-  const vals = [];
-  let i = 1;
+    const patch = ItemUpdate.parse(req.body);
 
-  for (const [k, v] of Object.entries(patch)) {
-    fields.push(`${k}=$${i++}`);
-    vals.push(v);
-  }
-  if (!fields.length) return res.status(400).json({ error: "No fields" });
+    // Simple guard: if marking sold, sold_price should exist
+    if (patch.in_store === false && patch.sold_price === undefined) {
+      return res.status(400).json({ error: "sold_price is required when marking sold" });
+    }
+    if (patch.in_store === false && patch.delivery_price === undefined) {
+      return res.status(400).json({ error: "delivery_price is required when marking sold" });
+    }
 
-  vals.push(id, req.user.id);
+    const fields = [];
+    const vals = [];
+    let i = 1;
 
-  const result = await pool.query(
-    `UPDATE items SET ${fields.join(", ")}
-     WHERE id=$${i++} AND user_id=$${i}
-     RETURNING *`,
-    vals
-  );
+    for (const [k, v] of Object.entries(patch)) {
+      fields.push(`${k}=$${i++}`);
+      vals.push(v);
+    }
+    if (!fields.length) return res.status(400).json({ error: "No fields" });
 
-  if (!result.rows[0]) return res.status(404).json({ error: "Not found" });
-  return res.json({ item: result.rows[0] });
-}));
+    vals.push(id, req.user.id);
 
-router.delete("/:id", requireAuth, asyncWrap(async (req, res) => {
-  const id = Number(req.params.id);
-  if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid id" });
+    const result = await pool.query(
+      `UPDATE items SET ${fields.join(", ")}
+       WHERE id=$${i++} AND user_id=$${i}
+       RETURNING *`,
+      vals
+    );
 
-  const result = await pool.query(
-    "DELETE FROM items WHERE id=$1 AND user_id=$2 RETURNING id",
-    [id, req.user.id]
-  );
+    if (!result.rows[0]) return res.status(404).json({ error: "Not found" });
+    return res.json({ item: result.rows[0] });
+  })
+);
 
-  if (!result.rows[0]) return res.status(404).json({ error: "Not found" });
-  return res.json({ ok: true });
-}));
+router.delete(
+  "/:id",
+  requireAuth,
+  asyncWrap(async (req, res) => {
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid id" });
 
+    const result = await pool.query(
+      "DELETE FROM items WHERE id=$1 AND user_id=$2 RETURNING id",
+      [id, req.user.id]
+    );
+
+    if (!result.rows[0]) return res.status(404).json({ error: "Not found" });
+    return res.json({ ok: true });
+  })
+);
 
 module.exports = router;
